@@ -303,7 +303,205 @@ Typical callers:
 
 ---
 
-## 5. Working with these files on a device
+## 5. Worked example: AMS starting an app process
+
+This is the path from "user taps an icon" to "bytes land in `cgroup.procs`". It is worth
+tracing once, because the cgroup placement happens in **two separate phases** that people
+routinely confuse: the zygote does an initial placement at fork time, and AMS corrects it
+a few milliseconds later once oom_adj has been computed.
+
+### Phase 1 — AMS decides to start, and passes a hint
+
+`ActivityManagerService` → `ProcessList.startProcessLocked()`. The only cgroup-relevant
+decision made here is whether the new process is the top app:
+
+```java
+// frameworks/base/services/core/java/com/android/server/am/ProcessList.java
+boolean isTopApp = hostingRecord.isTopApp();
+
+startResult = Process.start(entryPoint,
+        app.processName, uid, uid, gids, runtimeFlags, mountExternal,
+        app.info.targetSdkVersion, seInfo, requiredAbi, instructionSet,
+        app.info.dataDir, invokeWith, app.info.packageName,
+        zygotePolicyFlags,
+        isTopApp,                       // <-- the hint
+        app.getDisabledCompatChanges(), ...);
+```
+
+`isTopApp` rides through `ZygoteProcess` over the zygote socket as
+`--is-top-app`, into `Zygote.forkAndSpecialize()`.
+
+### Phase 2 — Zygote: create the per-app cgroup, apply an initial policy
+
+After the fork, the child runs `SpecializeCommon()` in
+`frameworks/base/core/jni/com_android_internal_os_Zygote.cpp`. Two things matter:
+
+```cpp
+// (a) create this app's own cgroup directories
+if (!is_system_server && getuid() == 0) {
+    const int rc = createProcessGroup(uid, getpid());
+    if (rc == -errno) {
+        fail_fn(CREATE_ERROR("createProcessGroup(%d, %d) failed: %s",
+                             uid, /* pid= */ 0, strerror(errno)));
+    }
+}
+
+// (b) initial scheduling policy
+SetSchedulerPolicy(fail_fn, is_top_app);
+```
+
+`createProcessGroup(uid, pid)` lives in libprocessgroup and uses the mount points that
+came from **`cgroups.json`**. It creates and populates:
+
+```
+/dev/cpuctl/uid_10123/pid_4711/cgroup.procs        # cpu controller (v1)
+/sys/fs/cgroup/uid_10123/pid_4711/cgroup.procs     # unified v2 (freezer, memory)
+```
+
+This per-app directory is the thing that makes two later operations cheap and reliable:
+
+- **freezing** the app — one write to `cgroup.freeze`
+- **killing** the app — `killProcessGroup()` signals every task in the directory, so
+  forked children and orphaned threads die too, instead of leaking
+
+`SetSchedulerPolicy()` then applies a coarse initial policy:
+
+```cpp
+static void SetSchedulerPolicy(fail_fn_t fail_fn, bool is_top_app) {
+  SchedPolicy policy = is_top_app ? SP_TOP_APP : SP_DEFAULT;
+  if (set_sched_policy(0, policy) == -1) {
+    fail_fn(CREATE_ERROR("set_sched_policy(0, %d) failed", policy));
+  }
+}
+```
+
+`set_sched_policy()` (in `libprocessgroup/sched_policy.cpp`) is where the enum finally
+becomes profile names from **`task_profiles.json`**:
+
+```cpp
+int set_sched_policy(int tid, SchedPolicy policy) {
+    if (tid == 0) tid = GetThreadId();
+    policy = _policy(policy);
+
+    switch (policy) {
+        case SP_BACKGROUND:
+            return SetTaskProfiles(tid, {"HighEnergySaving", "TimerSlackHigh"}, true)
+                   ? 0 : -1;
+        case SP_FOREGROUND:
+        case SP_AUDIO_APP:
+        case SP_AUDIO_SYS:
+            return SetTaskProfiles(tid, {"HighPerformance", "TimerSlackNormal"}, true)
+                   ? 0 : -1;
+        case SP_TOP_APP:
+            return SetTaskProfiles(tid, {"MaxPerformance", "TimerSlackNormal"}, true)
+                   ? 0 : -1;
+        case SP_SYSTEM:
+            return SetTaskProfiles(tid, {"ServiceCapacityLow", "TimerSlackNormal"}, true)
+                   ? 0 : -1;
+        ...
+    }
+}
+```
+
+The exact profile-name lists differ between releases — check the branch you are on. The
+structure does not: an `SP_*` enum maps to a fixed set of profile names, and everything
+device-specific lives in JSON below that line.
+
+### Phase 3 — AMS corrects the placement after oom_adj
+
+The app calls back with `attachApplication()`. AMS runs `updateOomAdjLocked()`, which
+computes both `curAdj` and `curSchedGroup`. `applyOomAdjLSP()` then acts on the sched
+group:
+
+```java
+// frameworks/base/services/core/java/com/android/server/am/OomAdjuster.java
+if (state.getCurrentSchedulingGroup() != state.getSetSchedGroup()) {
+    int processGroup;
+    switch (state.getCurrentSchedulingGroup()) {
+        case ProcessList.SCHED_GROUP_BACKGROUND:
+            processGroup = THREAD_GROUP_BACKGROUND;
+            break;
+        case ProcessList.SCHED_GROUP_TOP_APP:
+        case ProcessList.SCHED_GROUP_TOP_APP_BOUND:
+            processGroup = THREAD_GROUP_TOP_APP;
+            break;
+        case ProcessList.SCHED_GROUP_RESTRICTED:
+            processGroup = THREAD_GROUP_RESTRICTED;
+            break;
+        default:
+            processGroup = THREAD_GROUP_DEFAULT;
+            break;
+    }
+    mProcessGroupHandler.sendMessage(mProcessGroupHandler.obtainMessage(
+            0 /* unused */, app.getPid(), processGroup, app.processName));
+    // handler → Process.setProcessGroup(pid, group)
+}
+```
+
+The handler thread exists because `setProcessGroup()` walks every thread of the process
+and does synchronous `write()` calls into sysfs — you do not want that on the AMS lock.
+
+`Process.setProcessGroup()` → JNI `android_os_Process_setProcessGroup()` in
+`android_util_Process.cpp` → `SetProcessProfiles(uid, pid, {...})` in libprocessgroup.
+
+### Phase 4 — actions get applied
+
+For `THREAD_GROUP_TOP_APP` the resolved profile set is roughly
+`{"MaxPerformance", "ProcessCapacityMax", "MaxIoPriority", "TimerSlackNormal"}`.
+libprocessgroup looks each name up in the parsed `task_profiles.json` and executes its
+actions in order. Concretely, for a device using cpuset + uclamp:
+
+| Profile | Action | Resulting write |
+|---|---|---|
+| `ProcessCapacityMax` | `JoinCgroup` cpuset `top-app` | `4711` → `/dev/cpuset/top-app/cgroup.procs` |
+| `MaxPerformance` | `SetAttribute` `UClampMin` | `"max"` → `/dev/cpuctl/top-app/cpu.uclamp.min` |
+| `MaxIoPriority` | `SetAttribute` blkio weight | `"1000"` → `/dev/blkio/.../blkio.weight` |
+| `TimerSlackNormal` | `SetTimerSlack` | `50000` → `/proc/<tid>/timerslack_ns` |
+
+Nothing in AMS or the zygote knows any of those paths. Swap the vendor
+`task_profiles.json` and the same Java code produces entirely different writes.
+
+### Phase 5 — lifecycle changes reuse the same machinery
+
+- App goes to background → `SCHED_GROUP_BACKGROUND` → `SetProcessProfiles(uid, pid,
+  {"HighEnergySaving", "ProcessCapacityLow", "LowIoPriority", "TimerSlackHigh"})`
+- App becomes cached and eligible for freezing → `CachedAppOptimizer.freezeProcess()` →
+  `Process.setProcessFrozen()` → `SetProcessProfiles(uid, pid, {"Frozen"})` → `1` into
+  `/sys/fs/cgroup/uid_10123/pid_4711/cgroup.freeze`
+- App is killed → `Process.killProcessGroup(uid, pid)` → libprocessgroup signals every
+  task listed in that directory, then removes it
+
+### Tracing it on a real device
+
+```bash
+PID=$(adb shell pidof com.example.app)
+
+# where the zygote and AMS actually put it
+adb shell cat /proc/$PID/cgroup
+# 0::/uid_10123/pid_4711            <- v2, per-app dir from createProcessGroup()
+# 4:cpuset:/top-app                 <- v1, from ProcessCapacityMax
+# 2:cpu:/top-app                    <- v1, from MaxPerformance
+
+# confirm membership from the other side
+adb shell cat /dev/cpuset/top-app/cgroup.procs | grep $PID
+
+# watch it move when you background the app
+adb shell 'while true; do cat /proc/'$PID'/cgroup | grep cpuset; sleep 1; done'
+
+# the timer slack action landed here
+adb shell cat /proc/$PID/timerslack_ns
+
+# and the oom_adj/sched group decision that drove it
+adb shell dumpsys activity oom | grep -A2 com.example.app
+```
+
+If the process sits in the right cpuset but performance is still wrong, the profile
+applied fine and the problem is in the *contents* of `task_profiles.json` — that is the
+file to edit, not the framework.
+
+---
+
+## 6. Working with these files on a device
 
 ```bash
 # What the platform shipped
@@ -323,10 +521,16 @@ adb logcat -b all | grep -iE 'libprocessgroup|task_profiles|cgroup'
 
 ---
 
-## 6. References
+## 7. References
 
 - `system/core/libprocessgroup/` — implementation and the shipped JSON
 - `system/core/libprocessgroup/cgroup_map.cpp` — `cgroups.json` parsing, `cgroup.rc`
 - `system/core/libprocessgroup/task_profiles.cpp` — profile parsing and action classes
 - `system/core/libprocessgroup/include/processgroup/processgroup.h` — public API
+- `system/core/libprocessgroup/sched_policy.cpp` — `SP_*` enum → profile-name mapping
+- `frameworks/base/core/jni/com_android_internal_os_Zygote.cpp` — `SpecializeCommon()`,
+  `createProcessGroup()`, `SetSchedulerPolicy()`
+- `frameworks/base/services/core/java/com/android/server/am/OomAdjuster.java` —
+  `applyOomAdjLSP()`, sched group → `THREAD_GROUP_*`
+- `frameworks/base/core/jni/android_util_Process.cpp` — `setProcessGroup()` JNI
 - Kernel: `Documentation/admin-guide/cgroup-v1/`, `Documentation/admin-guide/cgroup-v2.rst`
